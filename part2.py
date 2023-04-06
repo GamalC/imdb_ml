@@ -19,6 +19,7 @@ feel free to use a subset of the data).
 """
 
 imdb_df = pd.read_csv(imdb_path) #, nrows=200)
+#Remove duplicates form the dataset
 imdb_df = imdb_df.drop_duplicates(subset=['Movie Name', 'Movie Date'], keep='first')
 print(imdb_df.columns)
 print(imdb_df.head)
@@ -36,6 +37,11 @@ n_letters = len(all_letters)
 """
 Prepocessing.
 """
+# Build the category_descriptions dictionary, a list of descriptins per 
+category_descriptions = {}
+all_categories = []
+
+"""
 # Turn a Unicode string to plain ASCII, thanks to https://stackoverflow.com/a/518232/2809427
 def unicodeToAscii(s):
     return ''.join(
@@ -44,17 +50,15 @@ def unicodeToAscii(s):
         and c in all_letters
     )
 
-# Build the category_lines dictionary, a list of descriptins per 
-category_lines = {}
-all_categories = []
-
-# Read a file and split into lines
+# Read a file and split into descriptions
 def get_descriptions():
     descriptions = list(imdb_df['Description'])
     return [unicodeToAscii(desc) for desc in descriptions]
+"""
 
+#Get dataset into format needed: link movie types to the descriptions and get categories.
 def get_categories():
-    movie_types = set() #imdb_df['Movie Type'])
+    movie_types = set()
     movie_type_to_descripton_mapping = defaultdict(set)
     for _, row in imdb_df.iterrows():
         row_movie_types = [mtyp.strip() for mtyp in row['Movie Type'].split(',')]
@@ -71,8 +75,7 @@ def get_categories():
 def letterToIndex(letter):
     return all_letters.find(letter)
 
-# Turn a line into a <line_length x 1 x n_letters>,
-# or an array of one-hot letter vectors
+# Turn a movie description into a <description_char_length x 1 x n_letters>, or an array of one-hot letter vectors
 def descToTensor(description):
     tensor = torch.zeros(len(description), 1, n_letters)
     for li, letter in enumerate(description):
@@ -80,7 +83,7 @@ def descToTensor(description):
     return tensor
 
 """
-Create network
+Create neural network model
 """
 class RNN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -105,33 +108,31 @@ class RNN(nn.Module):
 """
 Training.
 """
+#Return human readable catgeory given an output vector.
 def categoryFromOutput(output):
-    top_n, top_i = output.topk(1)
+    _, top_i = output.topk(1)
     category_i = top_i[0].item()
     return all_categories[category_i], category_i
 
 def randomChoice(l):
     return l[random.randint(0, len(l) - 1)]
 
+#Get a random training example
 def randomTrainingExample(all_categories, category_descs):
     category = randomChoice(all_categories)
-    line = randomChoice(category_descs[category])
+    description = randomChoice(category_descs[category])
     category_tensor = torch.tensor([all_categories.index(category)], dtype=torch.long)
-    line_tensor = descToTensor(line)
-    return category, line, category_tensor, line_tensor
+    desc_tensor = descToTensor(description)
+    return category, description, category_tensor, desc_tensor
 
-#for i in range(10):
-#    category, line, category_tensor, line_tensor = randomTrainingExample()
-#    print('category =', category, '/ line =', line)
-
-
-def train(category_tensor, line_tensor, rnn, learning_rate):
+#Train RNN model
+def train(category_tensor, desc_tensor, rnn, learning_rate, criterion):
     hidden = rnn.initHidden()
 
     rnn.zero_grad()
 
-    for i in range(line_tensor.size()[0]):
-        output, hidden = rnn(line_tensor[i], hidden)
+    for i in range(desc_tensor.size()[0]):
+        output, hidden = rnn(desc_tensor[i], hidden)
 
     loss = criterion(output, category_tensor)
     loss.backward()
@@ -142,6 +143,7 @@ def train(category_tensor, line_tensor, rnn, learning_rate):
 
     return output, loss.item()
 
+#Return time elapsed since a given time
 def timeSince(since):
     now = time.time()
     s = now - since
@@ -149,25 +151,7 @@ def timeSince(since):
     s -= m * 60
     return '%dm %ds' % (m, s)
 
-
-# Just return an output given a line
-def evaluate(line_tensor):
-    hidden = rnn.initHidden()
-
-    for i in range(line_tensor.size()[0]):
-        output, hidden = rnn(line_tensor[i], hidden)
-
-    return output
-
-if __name__ == '__main__':
-    category_descs, all_categories, n_categories = get_categories()
-    print(f"category lines keys: {category_descs.keys()}.\nCategory_descs subsample: {list(category_descs['Crime'])[:5]}\nCatgories subsample: {all_categories[:5]}, \nNo. of categories: {n_categories}")
-
-    n_hidden = 128
-    rnn = RNN(n_letters, n_hidden, n_categories)
-
-    criterion = nn.NLLLoss()
-    
+def train_setup(rnn, criterion):
     learning_rate = 0.005 # If you set this too high, it might explode. If too low, it might not learn
     n_iters = 100000
     print_every = 10000
@@ -179,20 +163,29 @@ if __name__ == '__main__':
     start = time.time()
 
     for iter in range(1, n_iters + 1):
-        category, line, category_tensor, line_tensor = randomTrainingExample(all_categories, category_descs)
-        output, loss = train(category_tensor, line_tensor, rnn, learning_rate)
+        category, description, category_tensor, desc_tensor = randomTrainingExample(all_categories, category_descs)
+        output, loss = train(category_tensor, desc_tensor, rnn, learning_rate, criterion)
         current_loss += loss
 
         # Print iter number, loss, name and guess
         if iter % print_every == 0:
             guess, guess_i = categoryFromOutput(output)
             correct = '✓' if guess == category else '✗ (%s)' % category
-            print('%d %d%% (%s) %.4f %s / %s %s' % (iter, iter / n_iters * 100, timeSince(start), loss, line, guess, correct))
-    
+            print('%d %d%% (%s) %.4f %s / %s %s' % (iter, iter / n_iters * 100, timeSince(start), loss, description, guess, correct))
 
-    """
-    Evaluation
-    """
+"""
+Evaluate model
+"""
+#Return an output given a description
+def evaluate(desc_tensor, rnn):
+    hidden = rnn.initHidden()
+
+    for i in range(desc_tensor.size()[0]):
+        output, hidden = rnn(desc_tensor[i], hidden)
+
+    return output
+
+def evaluate_with_confusion_matrix():
     # Keep track of correct guesses in a confusion matrix
     confusion = torch.zeros(n_categories, n_categories)
     n_confusion = 10000
@@ -201,8 +194,8 @@ if __name__ == '__main__':
     for i in range(n_confusion):
         if i % 100:
             print(f"{i} iterations completed.")
-        category, line, category_tensor, line_tensor = randomTrainingExample(all_categories, category_descs)
-        output = evaluate(line_tensor)
+        category, description, category_tensor, desc_tensor = randomTrainingExample(all_categories, category_descs)
+        output = evaluate(desc_tensor)
         guess, guess_i = categoryFromOutput(output)
         category_i = all_categories.index(category)
         confusion[category_i][guess_i] += 1
@@ -227,3 +220,14 @@ if __name__ == '__main__':
 
     # sphinx_gallery_thumbnail_number = 2
     plt.show()
+
+if __name__ == '__main__':
+    category_descs, all_categories, n_categories = get_categories()
+    print(f"category descriptions keys: {category_descs.keys()}.\nCategory_descs subsample: {list(category_descs['Crime'])[:5]}\nCatgories subsample: {all_categories[:5]}, \nNo. of categories: {n_categories}")
+
+    n_hidden = 128
+    rnn = RNN(n_letters, n_hidden, n_categories)
+    criterion = nn.NLLLoss()
+
+    train_setup(rnn, criterion)
+    evaluate_with_confusion_matrix()
