@@ -1,8 +1,12 @@
 import random
 import time
 import math
+import logging
+import sys
 import pandas as pd
 from collections import defaultdict
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
 imdb_path = "imdb_newdataset/imdb_database.csv"
 
@@ -18,13 +22,11 @@ feel free to use a subset of the data).
 - Select a relevant model and report results on your test set.
 """
 
-imdb_df = pd.read_csv(imdb_path) #, nrows=200)
-#Remove duplicates form the dataset
+logging.info("Loading in dataset...")
+imdb_df = pd.read_csv(imdb_path)
+#Remove duplicates from the dataset
 imdb_df = imdb_df.drop_duplicates(subset=['Movie Name', 'Movie Date'], keep='first')
-print(imdb_df.columns)
-print(imdb_df.head)
 
-import unicodedata
 import string
 import torch
 import torch.nn as nn
@@ -41,23 +43,8 @@ Prepocessing.
 category_descriptions = {}
 all_categories = []
 
-"""
-# Turn a Unicode string to plain ASCII, thanks to https://stackoverflow.com/a/518232/2809427
-def unicodeToAscii(s):
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', s)
-        if unicodedata.category(c) != 'Mn'
-        and c in all_letters
-    )
-
-# Read a file and split into descriptions
-def get_descriptions():
-    descriptions = list(imdb_df['Description'])
-    return [unicodeToAscii(desc) for desc in descriptions]
-"""
-
 #Get dataset into format needed: link movie types to the descriptions and get categories.
-def get_categories():
+def get_dataset():
     movie_types = set()
     movie_type_to_descripton_mapping = defaultdict(set)
     for _, row in imdb_df.iterrows():
@@ -67,9 +54,62 @@ def get_categories():
             movie_type_to_descripton_mapping[m_type].add(movie_description)
         movie_types.update(row_movie_types)
 
+    #Category has too few instances to spread across splits.
+    #TODO: moe sophisticated way of detectingthese catagories and removing them.
+    movie_types.remove('Adult')
+    del movie_type_to_descripton_mapping['Adult']
+
     n_categories = len(movie_types)
 
     return {key:list(val) for key, val in movie_type_to_descripton_mapping.items()}, list(movie_types), n_categories
+
+#Split the dataset into train/dev/test subsets.
+#TODO: use more sophisticated datset objects and tools provided in libraruies like PyTorch.
+def split_dataset(dataset_dict, dev_pct=10, test_pct=20):
+    train_set = defaultdict(list)
+    dev_set = defaultdict(list)
+    test_set = defaultdict(list)
+    dev_len = 0
+    test_len, train_len = 0, 0 
+
+    ds_instance_cnt = 0
+    for _, vals in dataset_dict.items():
+        ds_instance_cnt += len(vals)
+
+    max_test_len = int(test_pct/100.0 * ds_instance_cnt)
+    max_dev_len = int(dev_pct/100.0 * ds_instance_cnt)
+
+    #Ensure all sets have at least one entry in each category
+    for label, values in dataset_dict.items():
+        for set_choice, desc_ in zip(['train', 'dev', 'test'], values[:3]):
+            if set_choice == 'dev' and dev_len < max_dev_len:
+                dev_set[label].append(desc_)
+                dev_len += 1
+            elif set_choice == 'test' and test_len < max_test_len:
+                test_set[label].append(desc_)
+                test_len += 1
+            else:
+                train_set[label].append(desc_)
+                train_len += 1
+
+    #Allocate remaining instances.
+    for label, values in dataset_dict.items():
+        for desc_ in values[3:]:
+            set_choice = random.choices(['train', 'dev', 'test'], weights=(100-(dev_pct+test_pct), dev_pct, test_pct))[0]
+            if set_choice == 'dev' and dev_len < max_dev_len:
+                dev_set[label].append(desc_)
+                dev_len += 1
+            elif set_choice == 'test' and test_len < max_test_len:
+                test_set[label].append(desc_)
+                test_len += 1
+            else:
+                train_set[label].append(desc_)
+                train_len += 1
+
+    logging.info(f"Data split complete. Total instances was {ds_instance_cnt:,}.\nDatsest sizes: Train: {train_len:,}, dev: {dev_len:,}, test: {test_len:,}")
+    assert len(train_set) == len(dev_set) == len(test_set), f"Unaligned amount of movie categories: {len(train_set)}, {len(dev_set)}, {len(test_set)}."
+
+    return train_set, dev_set, test_set
 
 # Find letter index from all_letters, e.g. "a" = 0
 def letterToIndex(letter):
@@ -83,7 +123,7 @@ def descToTensor(description):
     return tensor
 
 """
-Create neural network model
+Create neural network model. An RNN.
 """
 class RNN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -114,13 +154,10 @@ def categoryFromOutput(output):
     category_i = top_i[0].item()
     return all_categories[category_i], category_i
 
-def randomChoice(l):
-    return l[random.randint(0, len(l) - 1)]
-
 #Get a random training example
 def randomTrainingExample(all_categories, category_descs):
-    category = randomChoice(all_categories)
-    description = randomChoice(category_descs[category])
+    category = random.choice(all_categories)
+    description = random.choice(category_descs[category])
     category_tensor = torch.tensor([all_categories.index(category)], dtype=torch.long)
     desc_tensor = descToTensor(description)
     return category, description, category_tensor, desc_tensor
@@ -151,27 +188,28 @@ def timeSince(since):
     s -= m * 60
     return '%dm %ds' % (m, s)
 
-def train_setup(rnn, criterion):
+def train_setup(rnn, criterion, all_labels, train_set, dev_set):
     learning_rate = 0.005 # If you set this too high, it might explode. If too low, it might not learn
-    n_iters = 100000
-    print_every = 10000
+    n_iters = 100
+    print_every = 10
 
     # Keep track of losses for plotting
     current_loss = 0
-    all_losses = []
 
     start = time.time()
 
     for iter in range(1, n_iters + 1):
-        category, description, category_tensor, desc_tensor = randomTrainingExample(all_categories, category_descs)
-        output, loss = train(category_tensor, desc_tensor, rnn, learning_rate, criterion)
+        category, description, category_tensor, desc_tensor = randomTrainingExample(all_labels, train_set)
+        _, loss = train(category_tensor, desc_tensor, rnn, learning_rate, criterion)
         current_loss += loss
 
         # Print iter number, loss, name and guess
         if iter % print_every == 0:
-            guess, guess_i = categoryFromOutput(output)
+            category, description, _, desc_tensor = randomTrainingExample(all_labels, dev_set)
+            dev_output = evaluate(desc_tensor, rnn)
+            guess, _ = categoryFromOutput(dev_output)
             correct = '✓' if guess == category else '✗ (%s)' % category
-            print('%d %d%% (%s) %.4f %s / %s %s' % (iter, iter / n_iters * 100, timeSince(start), loss, description, guess, correct))
+            logging.info('%d %d%% (%s) %.4f %s. Result: Guess: %s Gold: %s' % (iter, iter / n_iters * 100, timeSince(start), loss, description, guess, correct))
 
 """
 Evaluate model
@@ -185,18 +223,17 @@ def evaluate(desc_tensor, rnn):
 
     return output
 
-def evaluate_with_confusion_matrix():
+
+def evaluate_with_confusion_matrix(rnn, all_categories, category_descs, n_categories):
     # Keep track of correct guesses in a confusion matrix
     confusion = torch.zeros(n_categories, n_categories)
-    n_confusion = 10000
+    n_confusion = 100
 
     # Go through a bunch of examples and record which are correctly guessed
     for i in range(n_confusion):
-        if i % 100:
-            print(f"{i} iterations completed.")
-        category, description, category_tensor, desc_tensor = randomTrainingExample(all_categories, category_descs)
-        output = evaluate(desc_tensor)
-        guess, guess_i = categoryFromOutput(output)
+        category, _, _, desc_tensor = randomTrainingExample(all_categories, category_descs)
+        output = evaluate(desc_tensor, rnn)
+        _, guess_i = categoryFromOutput(output)
         category_i = all_categories.index(category)
         confusion[category_i][guess_i] += 1
 
@@ -218,16 +255,21 @@ def evaluate_with_confusion_matrix():
     ax.xaxis.set_major_locator(ticker.MultipleLocator(1))
     ax.yaxis.set_major_locator(ticker.MultipleLocator(1))
 
-    # sphinx_gallery_thumbnail_number = 2
     plt.show()
 
 if __name__ == '__main__':
-    category_descs, all_categories, n_categories = get_categories()
-    print(f"category descriptions keys: {category_descs.keys()}.\nCategory_descs subsample: {list(category_descs['Crime'])[:5]}\nCatgories subsample: {all_categories[:5]}, \nNo. of categories: {n_categories}")
+    logging.info("Preprocessing the data....")
+    category_descs, all_categories, n_categories = get_dataset()
+    train_category_descs, dev_category_descs, test_category_descs = split_dataset(category_descs)
+    
+    logging.info(f"category descriptions keys: {category_descs.keys()}.\nCategory_descs subsample: {list(category_descs['Crime'])[:5]}\nCatgories subsample: {all_categories[:5]}, \nNo. of categories: {n_categories}")
 
+    logging.info("Setting up the model...")
     n_hidden = 128
     rnn = RNN(n_letters, n_hidden, n_categories)
     criterion = nn.NLLLoss()
 
-    train_setup(rnn, criterion)
-    evaluate_with_confusion_matrix()
+    logging.info("Training the model...")
+    train_setup(rnn, criterion, all_categories, train_category_descs, dev_category_descs)
+    logging.info("Evaluating the model...")
+    evaluate_with_confusion_matrix(rnn, all_categories, test_category_descs, n_categories)
